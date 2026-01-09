@@ -1,13 +1,13 @@
+from sympy import tensor
 from header import *
 import torch.nn.functional as F
 from .ImageBind import *
 from .ImageBind import data
 from .modeling_llama import LlamaForCausalLM
 from transformers import StoppingCriteria, StoppingCriteriaList
-
 import torch
 from torch.nn.utils import rnn
-
+from .mib import mib
 class StoppingCriteriaSub(StoppingCriteria):
 
     def __init__(self, stops = [], encounters=1):
@@ -290,3 +290,108 @@ class OpenLLAMAPEFTModel(nn.Module):
         output_text = self.llama_tokenizer.decode(outputs[0][:-2], skip_special_tokens=True)
         return output_text
 
+class MCPandaModel(OpenLLAMAPEFTModel):
+    def __init__(self, **args):
+        super().__init__(**args)
+
+        hidden_size = self.llama_model.config.cross_attention_hidden_size
+        mib_dim = 128
+        beta = 1e-3
+
+        self.aux_head_image = mib(hidden_size, mib_dim, beta)
+        self.aux_head_audio = mib(hidden_size, mib_dim, beta)
+        self.aux_head_video = mib(hidden_size, mib_dim, beta)
+        self.to(self.device)
+
+    def get_text_embedding(self,input_ids):
+        with torch.no_grad():
+           embeds = self.llama_model.model.model.embed_tokens(input_ids)
+        return embeds.mean(dim=1)
+    def forward_main(self,inputs):
+        """
+        计算主任务 (多模态生成) 的 Loss。
+        修正：融合 Image 和 Audio 特征，实现真正的三模态输入。
+        """
+        # 1. 获取图像特征 [Batch, 1, Hidden]
+        image_paths = inputs['image_paths']
+        if image_paths and image_paths[0] is not None:
+            img_embeds, _ = self.encode_image(image_paths)
+        else:
+            # 制造全 0 的 dummy embedding (保持维度)
+            img_embeds, _ = self.encode_image(image_paths) 
+
+        # 2. 获取音频特征 [Batch, 1, Hidden]
+        audio_paths = inputs.get('audio_paths')
+        audio_embeds = None
+        if audio_paths and audio_paths[0] is not None:
+            audio_embeds, _ = self.encode_audio(audio_paths)
+
+        # 3. [关键] 多模态特征融合
+        # PandaGPT/ImageBind 将各模态对齐到同一空间，因此可以直接相加
+        # 这样做的好处是 Token 数量保持为 1，兼容父类的 prompt_wrap 逻辑
+        if audio_embeds is not None:
+            # 融合策略：Image + Audio
+            multimodal_embeds = img_embeds + audio_embeds
+        else:
+            multimodal_embeds = img_embeds
+
+        # 4. 处理文本输入
+        output_texts = inputs['output_texts']
+        input_ids, target_ids, attention_mask = process_batch_instance(
+            self.llama_tokenizer, output_texts, self.max_tgt_len
+        )
+        
+        input_ids = input_ids.to(self.device)
+        target_ids = target_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        
+        # 5. 包装 Prompt
+        # 注意：这里传入的是融合后的 multimodal_embeds
+        inputs_embeds, targets, attention_mask = self.prompt_wrap(
+            multimodal_embeds, input_ids, target_ids, attention_mask
+        )
+
+        # 6. LLM 前向传播
+        outputs = self.llama_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            labels=targets,
+        )
+        return outputs.loss
+    def forward_aux(self, inputs):
+        """计算辅助任务的 Loss (使用 MIB)"""
+        labels = inputs['labels'].to(self.device)
+        losses = {}
+
+        # --- Image Aux ---
+        if inputs['image_paths'] and inputs['image_paths'][0] is not None:
+            img_embeds, _ = self.encode_image(inputs['image_paths']) 
+            # img_embeds: [B, 1, H] -> squeeze -> [B, H]
+            img_feat = img_embeds.squeeze(1)
+            _, _, loss_v = self.aux_head_image(img_feat, labels)
+            losses['loss_v'] = loss_v
+        else:
+            losses['loss_v'] = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # --- Audio Aux ---
+        if inputs['audio_paths'] and inputs['audio_paths'][0] is not None:
+            aud_embeds, _ = self.encode_audio(inputs['audio_paths'])
+            aud_feat = aud_embeds.squeeze(1)
+            _, _, loss_a = self.aux_head_audio(aud_feat, labels)
+            losses['loss_a'] = loss_a
+        else:
+            losses['loss_a'] = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # --- Text Aux ---
+        output_texts = inputs['output_texts']
+        input_ids, _, _ = process_batch_instance(
+            self.llama_tokenizer, output_texts, self.max_tgt_len
+        )
+        input_ids = input_ids.to(self.device)
+        text_feat = self.get_text_embedding(input_ids)
+        
+        _, _, loss_t = self.aux_head_text(text_feat, labels)
+        losses['loss_t'] = loss_t
+
+        return losses

@@ -1,8 +1,8 @@
 import torch
 import datetime
 import types
-import deepspeed
-from transformers.deepspeed import HfDeepSpeedConfig
+#import deepspeed
+#from transformers.deepspeed import HfDeepSpeedConfig
 import transformers
 import numpy as np
 from collections import OrderedDict
