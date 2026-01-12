@@ -2,7 +2,7 @@ import json
 import os
 import torch
 from code.datasets.sft_dataset import SupervisedDataset
-class MCPSupercisedDataset(SupervisedDataset):
+class MCPSupervisedDataset(SupervisedDataset):
     def __init__(self, data_path: str, image_root_path: str,audio_root_path: str):
         with open(data_path,'r') as f:
             json_data = json.load(f)
