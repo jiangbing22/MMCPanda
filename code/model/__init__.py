@@ -1,5 +1,6 @@
 from .agent import DeepSpeedAgent
 from .openllama import OpenLLAMAPEFTModel
+from .openllama import MCPandaModel
 
 def load_model(args):
     agent_name = args['models'][args['model']]['agent_name']

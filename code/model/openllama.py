@@ -8,8 +8,9 @@ from transformers import StoppingCriteria, StoppingCriteriaList
 import torch
 from torch.nn.utils import rnn
 from .mib import mib
-class StoppingCriteriaSub(StoppingCriteria):
 
+# ... (StoppingCriteriaSub, build_one_instance, process_batch_instance 保持不变) ...
+class StoppingCriteriaSub(StoppingCriteria):
     def __init__(self, stops = [], encounters=1):
         super().__init__()
         self.stops = stops
@@ -35,7 +36,7 @@ def build_one_instance(tokenizer, conversation):
             text = '</Img> ' + turn['value'] + '\n### Assistant:'
             one_input_id = tokenizer(text, add_special_tokens=False).input_ids
             input_ids += one_input_id
-            target_ids += [-100]*len(one_input_id) # do not perform loss regression on human prompt
+            target_ids += [-100]*len(one_input_id) 
         else:
             if role == 'human':
                 text = 'Human: ' + turn['value'] + '\n### Assistant:'
@@ -69,29 +70,27 @@ def process_batch_instance(tokenizer, batch_of_conversations, max_tgt_len):
     return input_ids, target_ids, attention_mask.long()
 
 PROMPT_START = '### Human: <Img>'
+
 class OpenLLAMAPEFTModel(nn.Module):
-
     '''LoRA for LLaMa model'''
-
     def __init__(self, **args):
         super(OpenLLAMAPEFTModel, self).__init__()
         self.args = args
         imagebind_ckpt_path = args['imagebind_ckpt_path']
         vicuna_ckpt_path = args['vicuna_ckpt_path']
+        delta_ckpt_path = args.get('delta_ckpt_path') # [FIX] 使用 get 防止报错
         max_tgt_len = args['max_tgt_len']
         stage = args['stage']
 
         print (f'Initializing visual encoder from {imagebind_ckpt_path} ...')
         self.visual_encoder, self.visual_hidden_size = \
         imagebind_model.imagebind_huge(pretrained=True, store_path=imagebind_ckpt_path)
-        # free vision encoder
         for name, param in self.visual_encoder.named_parameters():
             param.requires_grad = False
         self.visual_encoder.eval()
         print ('Visual encoder initialized.')
 
         print (f'Initializing language decoder from {vicuna_ckpt_path} ...')
-        # add the lora module
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, 
             inference_mode=False, 
@@ -113,86 +112,98 @@ class OpenLLAMAPEFTModel(nn.Module):
         self.llama_proj = nn.Linear(
             self.visual_hidden_size, self.llama_model.config.hidden_size
         )
+        
+        # =================================================================
+        # [FIX] 核心修改：加载 PandaGPT 的预训练 Delta 权重 (LoRA + Projector)
+        # =================================================================
+        if delta_ckpt_path is not None:
+            print(f'Loading pretrained delta weights from {delta_ckpt_path} ...')
+            # 假设 delta_ckpt_path 指向 pytorch_model.pt 文件
+            delta_state_dict = torch.load(delta_ckpt_path, map_location='cpu')
+            
+            # 加载 weights，设置 strict=False 因为 delta 只有部分参数
+            load_result = self.load_state_dict(delta_state_dict, strict=False)
+            print(f"Delta weights loaded. Result: {load_result}")
+            
+            # 验证 Projector 是否被正确加载 (防止 key 不匹配)
+            # PandaGPT 的权重 key 通常是 'llama_proj.weight', 'llama_proj.bias'
+            if 'llama_proj.weight' not in delta_state_dict:
+                print("WARNING: llama_proj.weight not found in delta checkpoint! Projector is random!")
+        else:
+            print('No delta_ckpt_path provided. Training from scratch.')
+        # =================================================================
 
         self.max_tgt_len = max_tgt_len
         self.device = torch.cuda.current_device()
 
+    # ... (encode_video, encode_audio, encode_thermal, encode_image, prompt_wrap, forward 等方法保持不变) ...
     def encode_video(self, video_paths):
         inputs = {ModalityType.VISION: data.load_and_transform_video_data(video_paths, self.device)}
-        # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
             embeddings = self.visual_encoder(inputs)
-            video_embeds = embeddings[ModalityType.VISION] # bsz x 1024
-        inputs_llama = self.llama_proj(video_embeds).unsqueeze(1) # bsz x 1 x llama_size
-        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) # bsz x 1
+            video_embeds = embeddings[ModalityType.VISION] 
+        inputs_llama = self.llama_proj(video_embeds).unsqueeze(1) 
+        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) 
         return inputs_llama, atts_llama
 
     def encode_audio(self, audio_paths):
         inputs = {ModalityType.AUDIO: data.load_and_transform_audio_data(audio_paths, self.device)}
-        # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
             embeddings = self.visual_encoder(inputs)
-            audio_embeds = embeddings[ModalityType.AUDIO] # bsz x 1024
-        inputs_llama = self.llama_proj(audio_embeds).unsqueeze(1) # bsz x 1 x llama_size
-        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) # bsz x 1
+            audio_embeds = embeddings[ModalityType.AUDIO] 
+        inputs_llama = self.llama_proj(audio_embeds).unsqueeze(1) 
+        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) 
         return inputs_llama, atts_llama
 
     def encode_thermal(self, thermal_paths):
         inputs = {ModalityType.THERMAL: data.load_and_transform_thermal_data(thermal_paths, self.device)}
-        # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
             embeddings = self.visual_encoder(inputs)
-            image_embeds = embeddings['thermal'] # bsz x 1024
-        inputs_llama = self.llama_proj(image_embeds).unsqueeze(1) # bsz x 1 x llama_size
-        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) # bsz x 1
+            image_embeds = embeddings['thermal'] 
+        inputs_llama = self.llama_proj(image_embeds).unsqueeze(1) 
+        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) 
         return inputs_llama, atts_llama
 
     def encode_image(self, image_paths):
         inputs = {ModalityType.VISION: data.load_and_transform_vision_data(image_paths, self.device)}
-        # convert into visual dtype
         inputs = {key: inputs[key].to(self.llama_model.dtype) for key in inputs}
         with torch.no_grad():
             embeddings = self.visual_encoder(inputs)
-            image_embeds = embeddings['vision'] # bsz x 1024
-        inputs_llama = self.llama_proj(image_embeds).unsqueeze(1) # bsz x 1 x llama_size
-        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) # bsz x 1
+            image_embeds = embeddings['vision'] 
+        inputs_llama = self.llama_proj(image_embeds).unsqueeze(1) 
+        atts_llama = torch.ones(inputs_llama.size()[:-1], dtype=torch.long).to(self.device) 
         return inputs_llama, atts_llama
 
     def prompt_wrap(self, img_embeds, input_ids, target_ids, attention_mask):
-        '''
-            input_ids, target_ids, attention_mask: bsz x s2
-        '''
-        input_ids = input_ids.to(self.device) # bsz x s2
-        target_ids = target_ids.to(self.device) # bsz x s2
-        attention_mask = attention_mask.to(self.device) # bsz x s2
+        input_ids = input_ids.to(self.device) 
+        target_ids = target_ids.to(self.device) 
+        attention_mask = attention_mask.to(self.device) 
 
         batch_size = img_embeds.shape[0]
         p_before = PROMPT_START
         p_before_tokens = self.llama_tokenizer(p_before, 
             return_tensors="pt", add_special_tokens=False).to(self.device)
-        # peft model need deeper call
-        p_before_embeds = self.llama_model.model.model.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1) # bsz x s1 x embed_dim
-        p_after_embeds = self.llama_model.model.model.embed_tokens(input_ids).expand(batch_size, -1, -1) # bsz x s2 x embed_dim
+        p_before_embeds = self.llama_model.model.model.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1) 
+        p_after_embeds = self.llama_model.model.model.embed_tokens(input_ids).expand(batch_size, -1, -1) 
         bos = torch.ones([batch_size, 1],
                          dtype=p_before_tokens.input_ids.dtype,
-                         device=p_before_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id # bsz x 1
-        bos_embeds = self.llama_model.model.model.embed_tokens(bos) # bsz x 1 x embed_dim
-        inputs_embeds = torch.cat([bos_embeds, p_before_embeds, img_embeds, p_after_embeds], dim=1) # bsz x (1+s1+1+s2) x embed_dim
+                         device=p_before_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id 
+        bos_embeds = self.llama_model.model.model.embed_tokens(bos) 
+        inputs_embeds = torch.cat([bos_embeds, p_before_embeds, img_embeds, p_after_embeds], dim=1) 
 
-        # create targets
         empty_targets = (
-            torch.ones([batch_size, 1+p_before_embeds.size()[1]+1], # 1 (bos) + s1 + 1 (image vector)
+            torch.ones([batch_size, 1+p_before_embeds.size()[1]+1], 
                        dtype=torch.long).to(self.device).fill_(-100)  
-        ) # bsz x (1 + s1 + 1)
-        targets = torch.cat([empty_targets, target_ids], dim=1) # bsz x (1 + s1 + 1 + s2)
+        ) 
+        targets = torch.cat([empty_targets, target_ids], dim=1) 
         assert inputs_embeds.size()[1] == targets.size()[1]
 
-        atts_prefix = torch.ones([batch_size, 1+p_before_embeds.size()[1]+1], dtype=torch.long).to(self.device) # bsz x (1 + s1 +1)
+        atts_prefix = torch.ones([batch_size, 1+p_before_embeds.size()[1]+1], dtype=torch.long).to(self.device) 
         attention_mask = torch.cat([atts_prefix, attention_mask], dim=1)
-        assert attention_mask.size() == targets.size() # bsz x (1 + s1 + 1 + s2)
+        assert attention_mask.size() == targets.size() 
         return inputs_embeds, targets, attention_mask 
 
     def forward(self, inputs):
@@ -210,15 +221,15 @@ class OpenLLAMAPEFTModel(nn.Module):
             labels=targets,
         )
         loss = outputs.loss
-        # calculate the token accuarcy
-        chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]    # [B, S-1]
+        chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]   
         labels = targets[:, 2:]
-        gen_acc = (chosen_tokens.reshape(-1) == labels.reshape(-1)).to(torch.long)    # [B*S]
+        gen_acc = (chosen_tokens.reshape(-1) == labels.reshape(-1)).to(torch.long)    
         valid_mask = (labels != -100).reshape(-1)
-        valid_tokens = gen_acc & valid_mask    # [B*S]
+        valid_tokens = gen_acc & valid_mask   
         gen_acc = valid_tokens.sum().item() / valid_mask.sum().item()
         return loss, gen_acc
 
+    # ... extract_multimodal_feature, prepare_generation_embedding, generate ...
     def extract_multimodal_feature(self, inputs):
         features = []
         if inputs['image_paths']:
@@ -249,33 +260,18 @@ class OpenLLAMAPEFTModel(nn.Module):
         p_before = PROMPT_START
         p_before_tokens = self.llama_tokenizer(p_before, 
             return_tensors="pt", add_special_tokens=False).to(self.device)
-        p_before_embeds = self.llama_model.model.model.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1) # bsz x s1 x embed_dim
+        p_before_embeds = self.llama_model.model.model.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1) 
         text = '</Img> ' + prompt + '\n### Assistant:'
         p_after_tokens = self.llama_tokenizer(text, add_special_tokens=False, return_tensors='pt').to(self.device)
-        p_after_embeds = self.llama_model.model.model.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1) # bsz x s1 x embed_dim
+        p_after_embeds = self.llama_model.model.model.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1) 
         bos = torch.ones([batch_size, 1],
                          dtype=p_before_tokens.input_ids.dtype,
-                         device=p_before_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id # bsz x 1
-        bos_embeds = self.llama_model.model.model.embed_tokens(bos) # bsz x 1 x embed_dim
-        inputs_embeds = torch.cat([bos_embeds, p_before_embeds, feature_embeds, p_after_embeds], dim=1) # bsz x (1+s1+1+s2) x embed_dim
+                         device=p_before_tokens.input_ids.device) * self.llama_tokenizer.bos_token_id 
+        bos_embeds = self.llama_model.model.model.embed_tokens(bos) 
+        inputs_embeds = torch.cat([bos_embeds, p_before_embeds, feature_embeds, p_after_embeds], dim=1) 
         return inputs_embeds
 
     def generate(self, inputs):
-        '''
-            inputs = {
-                'image_paths': optional,
-                'audio_paths': optional
-                'video_paths': optional
-                'thermal_paths': optional
-                'mode': generation mode,
-                'prompt': human input prompt,
-                'max_tgt_len': generation length,
-                'top_p': top_p,
-                'temperature': temperature
-                'modality_embeds': None or torch.tensor
-                'modality_cache': save the image cache
-            }
-        '''
         input_embeds = self.prepare_generation_embedding(inputs)
         stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops=[2277], encounters=1)])
         outputs = self.llama_model.generate(
@@ -290,6 +286,7 @@ class OpenLLAMAPEFTModel(nn.Module):
         output_text = self.llama_tokenizer.decode(outputs[0][:-2], skip_special_tokens=True)
         return output_text
 
+
 class MCPandaModel(OpenLLAMAPEFTModel):
     def __init__(self, **args):
         super().__init__(**args)
@@ -300,42 +297,37 @@ class MCPandaModel(OpenLLAMAPEFTModel):
 
         self.aux_head_image = mib(hidden_size, mib_dim, beta)
         self.aux_head_audio = mib(hidden_size, mib_dim, beta)
-        self.aux_head_video = mib(hidden_size, mib_dim, beta)
+        # [FIX] 补充 Text 辅助头，否则 forward_aux 会报错
+        self.aux_head_text = mib(hidden_size, mib_dim, beta)
+        
         self.to(self.device)
 
     def get_text_embedding(self,input_ids):
         with torch.no_grad():
            embeds = self.llama_model.model.model.embed_tokens(input_ids)
         return embeds.mean(dim=1)
+
     def forward_main(self,inputs):
-        """
-        计算主任务 (多模态生成) 的 Loss。
-        修正：融合 Image 和 Audio 特征，实现真正的三模态输入。
-        """
-        # 1. 获取图像特征 [Batch, 1, Hidden]
+        # 1. 获取图像特征
         image_paths = inputs['image_paths']
         if image_paths and image_paths[0] is not None:
             img_embeds, _ = self.encode_image(image_paths)
         else:
-            # 制造全 0 的 dummy embedding (保持维度)
             img_embeds, _ = self.encode_image(image_paths) 
 
-        # 2. 获取音频特征 [Batch, 1, Hidden]
+        # 2. 获取音频特征
         audio_paths = inputs.get('audio_paths')
         audio_embeds = None
         if audio_paths and audio_paths[0] is not None:
             audio_embeds, _ = self.encode_audio(audio_paths)
 
-        # 3. [关键] 多模态特征融合
-        # PandaGPT/ImageBind 将各模态对齐到同一空间，因此可以直接相加
-        # 这样做的好处是 Token 数量保持为 1，兼容父类的 prompt_wrap 逻辑
+        # 3. 特征融合
         if audio_embeds is not None:
-            # 融合策略：Image + Audio
             multimodal_embeds = img_embeds + audio_embeds
         else:
             multimodal_embeds = img_embeds
 
-        # 4. 处理文本输入
+        # 4. 文本处理
         output_texts = inputs['output_texts']
         input_ids, target_ids, attention_mask = process_batch_instance(
             self.llama_tokenizer, output_texts, self.max_tgt_len
@@ -345,13 +337,10 @@ class MCPandaModel(OpenLLAMAPEFTModel):
         target_ids = target_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
         
-        # 5. 包装 Prompt
-        # 注意：这里传入的是融合后的 multimodal_embeds
         inputs_embeds, targets, attention_mask = self.prompt_wrap(
             multimodal_embeds, input_ids, target_ids, attention_mask
         )
 
-        # 6. LLM 前向传播
         outputs = self.llama_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -359,15 +348,14 @@ class MCPandaModel(OpenLLAMAPEFTModel):
             labels=targets,
         )
         return outputs.loss
+
     def forward_aux(self, inputs):
-        """计算辅助任务的 Loss (使用 MIB)"""
         labels = inputs['labels'].to(self.device)
         losses = {}
 
         # --- Image Aux ---
         if inputs['image_paths'] and inputs['image_paths'][0] is not None:
             img_embeds, _ = self.encode_image(inputs['image_paths']) 
-            # img_embeds: [B, 1, H] -> squeeze -> [B, H]
             img_feat = img_embeds.squeeze(1)
             _, _, loss_v = self.aux_head_image(img_feat, labels)
             losses['loss_v'] = loss_v
